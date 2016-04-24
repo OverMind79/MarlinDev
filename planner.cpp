@@ -1,4 +1,26 @@
 /**
+ * Marlin 3D Printer Firmware
+ * Copyright (C) 2016 MarlinFirmware [https://github.com/MarlinFirmware/Marlin]
+ *
+ * Based on Sprinter and grbl.
+ * Copyright (C) 2011 Camiel Gubbels / Erik van der Zalm
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ */
+
+/**
  * planner.cpp - Buffer movement commands and manage the acceleration profile plan
  * Part of Grbl
  *
@@ -93,6 +115,10 @@ unsigned long axis_steps_per_sqr_second[NUM_AXIS];
   bool autotemp_enabled = false;
 #endif
 
+#if ENABLED(FAN_SOFT_PWM)
+  extern unsigned char fanSpeedSoftPwm[FAN_COUNT];
+#endif
+
 //===========================================================================
 //============ semi-private variables, used in inline functions =============
 //===========================================================================
@@ -119,10 +145,6 @@ uint8_t g_uc_extruder_last_move[EXTRUDERS] = { 0 };
   static unsigned char old_direction_bits = 0;
   // Segment times (in µs). Used for speed calculations
   static long axis_segment_time[2][3] = { {MAX_FREQ_TIME + 1, 0, 0}, {MAX_FREQ_TIME + 1, 0, 0} };
-#endif
-
-#if ENABLED(FILAMENT_SENSOR)
-  static char meas_sample; //temporary variable to hold filament measurement sample
 #endif
 
 #if ENABLED(DUAL_X_CARRIAGE)
@@ -331,7 +353,7 @@ void planner_recalculate_trapezoids() {
   // Last/newest block in buffer. Exit speed is set with MINIMUM_PLANNER_SPEED. Always recalculated.
   if (next) {
     float nom = next->nominal_speed;
-    calculate_trapezoid_for_block(next, next->entry_speed / nom, MINIMUM_PLANNER_SPEED / nom);
+    calculate_trapezoid_for_block(next, next->entry_speed / nom, (MINIMUM_PLANNER_SPEED) / nom);
     next->recalculate_flag = false;
   }
 }
@@ -389,8 +411,8 @@ void plan_init() {
     float t = autotemp_min + high * autotemp_factor;
     t = constrain(t, autotemp_min, autotemp_max);
     if (oldt > t) {
-      t *= (1 - AUTOTEMP_OLDWEIGHT);
-      t += AUTOTEMP_OLDWEIGHT * oldt;
+      t *= (1 - (AUTOTEMP_OLDWEIGHT));
+      t += (AUTOTEMP_OLDWEIGHT) * oldt;
     }
     oldt = t;
     setTargetHotend0(t);
@@ -399,67 +421,119 @@ void plan_init() {
 
 void check_axes_activity() {
   unsigned char axis_active[NUM_AXIS] = { 0 },
-                tail_fan_speed = fanSpeed;
+                tail_fan_speed[FAN_COUNT];
+
+  #if FAN_COUNT > 0
+    for (uint8_t i = 0; i < FAN_COUNT; i++) tail_fan_speed[i] = fanSpeeds[i];
+  #endif
+
   #if ENABLED(BARICUDA)
-    unsigned char tail_valve_pressure = ValvePressure,
-                  tail_e_to_p_pressure = EtoPPressure;
+    unsigned char tail_valve_pressure = baricuda_valve_pressure,
+                  tail_e_to_p_pressure = baricuda_e_to_p_pressure;
   #endif
 
   block_t* block;
 
   if (blocks_queued()) {
+
     uint8_t block_index = block_buffer_tail;
-    tail_fan_speed = block_buffer[block_index].fan_speed;
+
+    #if FAN_COUNT > 0
+      for (uint8_t i = 0; i < FAN_COUNT; i++) tail_fan_speed[i] = block_buffer[block_index].fan_speed[i];
+    #endif
+
     #if ENABLED(BARICUDA)
       block = &block_buffer[block_index];
       tail_valve_pressure = block->valve_pressure;
       tail_e_to_p_pressure = block->e_to_p_pressure;
     #endif
+
     while (block_index != block_buffer_head) {
       block = &block_buffer[block_index];
       for (int i = 0; i < NUM_AXIS; i++) if (block->steps[i]) axis_active[i]++;
       block_index = next_block_index(block_index);
     }
   }
-  if (DISABLE_X && !axis_active[X_AXIS]) disable_x();
-  if (DISABLE_Y && !axis_active[Y_AXIS]) disable_y();
-  if (DISABLE_Z && !axis_active[Z_AXIS]) disable_z();
-  if (DISABLE_E && !axis_active[E_AXIS]) {
-    disable_e0();
-    disable_e1();
-    disable_e2();
-    disable_e3();
-  }
+  #if ENABLED(DISABLE_X)
+    if (!axis_active[X_AXIS]) disable_x();
+  #endif
+  #if ENABLED(DISABLE_Y)
+    if (!axis_active[Y_AXIS]) disable_y();
+  #endif
+  #if ENABLED(DISABLE_Z)
+    if (!axis_active[Z_AXIS]) disable_z();
+  #endif
+  #if ENABLED(DISABLE_E)
+    if (!axis_active[E_AXIS]) {
+      disable_e0();
+      disable_e1();
+      disable_e2();
+      disable_e3();
+    }
+  #endif
 
-  #if HAS_FAN
+  #if FAN_COUNT > 0
+
+    #if defined(FAN_MIN_PWM)
+      #define CALC_FAN_SPEED(f) (tail_fan_speed[f] ? ( FAN_MIN_PWM + (tail_fan_speed[f] * (255 - FAN_MIN_PWM)) / 255 ) : 0)
+    #else
+      #define CALC_FAN_SPEED(f) tail_fan_speed[f]
+    #endif
+
     #ifdef FAN_KICKSTART_TIME
-      static millis_t fan_kick_end;
-      if (tail_fan_speed) {
-        millis_t ms = millis();
-        if (fan_kick_end == 0) {
-          // Just starting up fan - run at full power.
-          fan_kick_end = ms + FAN_KICKSTART_TIME;
-          tail_fan_speed = 255;
+
+      static millis_t fan_kick_end[FAN_COUNT] = { 0 };
+
+      #define KICKSTART_FAN(f) \
+        if (tail_fan_speed[f]) { \
+          millis_t ms = millis(); \
+          if (fan_kick_end[f] == 0) { \
+            fan_kick_end[f] = ms + FAN_KICKSTART_TIME; \
+            tail_fan_speed[f] = 255; \
+          } else { \
+            if (PENDING(ms, fan_kick_end[f])) { \
+              tail_fan_speed[f] = 255; \
+            } \
+          } \
+        } else { \
+          fan_kick_end[f] = 0; \
         }
-        else if (fan_kick_end > ms)
-          // Fan still spinning up.
-          tail_fan_speed = 255;
-        }
-        else {
-          fan_kick_end = 0;
-        }
+
+      #if HAS_FAN0
+        KICKSTART_FAN(0);
+      #endif
+      #if HAS_FAN1
+        KICKSTART_FAN(1);
+      #endif
+      #if HAS_FAN2
+        KICKSTART_FAN(2);
+      #endif
+
     #endif //FAN_KICKSTART_TIME
-    #if ENABLED(FAN_MIN_PWM)
-      #define CALC_FAN_SPEED (tail_fan_speed ? ( FAN_MIN_PWM + (tail_fan_speed * (255 - FAN_MIN_PWM)) / 255 ) : 0)
-    #else
-      #define CALC_FAN_SPEED tail_fan_speed
-    #endif // FAN_MIN_PWM
+
     #if ENABLED(FAN_SOFT_PWM)
-      fanSpeedSoftPwm = CALC_FAN_SPEED;
+      #if HAS_FAN0
+        fanSpeedSoftPwm[0] = CALC_FAN_SPEED(0);
+      #endif
+      #if HAS_FAN1
+        fanSpeedSoftPwm[1] = CALC_FAN_SPEED(1);
+      #endif
+      #if HAS_FAN2
+        fanSpeedSoftPwm[2] = CALC_FAN_SPEED(2);
+      #endif
     #else
-      analogWrite(FAN_PIN, CALC_FAN_SPEED);
-    #endif // FAN_SOFT_PWM
-  #endif // HAS_FAN
+      #if HAS_FAN0
+        analogWrite(FAN_PIN, CALC_FAN_SPEED(0));
+      #endif
+      #if HAS_FAN1
+        analogWrite(FAN1_PIN, CALC_FAN_SPEED(1));
+      #endif
+      #if HAS_FAN2
+        analogWrite(FAN2_PIN, CALC_FAN_SPEED(2));
+      #endif
+    #endif
+
+  #endif // FAN_COUNT > 0
 
   #if ENABLED(AUTOTEMP)
     getHighESpeed();
@@ -494,7 +568,7 @@ float junction_deviation = 0.1;
   while (block_buffer_tail == next_buffer_head) idle();
 
   #if ENABLED(MESH_BED_LEVELING)
-    if (mbl.active) z += mbl.get_z(x, y);
+    if (mbl.active) z += mbl.get_z(x - home_offset[X_AXIS], y - home_offset[Y_AXIS]);
   #elif ENABLED(AUTO_BED_LEVELING_FEATURE)
     apply_rotation_xyz(plan_bed_level_matrix, x, y, z);
   #endif
@@ -513,7 +587,7 @@ float junction_deviation = 0.1;
        dz = target[Z_AXIS] - position[Z_AXIS];
 
   // DRYRUN ignores all temperature constraints and assures that the extruder is instantly satisfied
-  if (marlin_debug_flags & DEBUG_DRYRUN)
+  if (DEBUGGING(DRYRUN))
     position[E_AXIS] = target[E_AXIS];
 
   long de = target[E_AXIS] - position[E_AXIS];
@@ -527,7 +601,7 @@ float junction_deviation = 0.1;
         SERIAL_ECHOLNPGM(MSG_ERR_COLD_EXTRUDE_STOP);
       }
       #if ENABLED(PREVENT_LENGTHY_EXTRUDE)
-        if (labs(de) > axis_steps_per_unit[E_AXIS] * EXTRUDE_MAXLENGTH) {
+        if (labs(de) > axis_steps_per_unit[E_AXIS] * (EXTRUDE_MAXLENGTH)) {
           position[E_AXIS] = target[E_AXIS]; // Behave as if the move really took place, but ignore E part
           de = 0; // no difference
           SERIAL_ECHO_START;
@@ -571,10 +645,13 @@ float junction_deviation = 0.1;
   // Bail if this is a zero-length block
   if (block->step_event_count <= dropsegments) return;
 
-  block->fan_speed = fanSpeed;
+  #if FAN_COUNT > 0
+    for (uint8_t i = 0; i < FAN_COUNT; i++) block->fan_speed[i] = fanSpeeds[i];
+  #endif
+
   #if ENABLED(BARICUDA)
-    block->valve_pressure = ValvePressure;
-    block->e_to_p_pressure = EtoPPressure;
+    block->valve_pressure = baricuda_valve_pressure;
+    block->e_to_p_pressure = baricuda_e_to_p_pressure;
   #endif
 
   // Compute direction bits for this block
@@ -637,10 +714,10 @@ float junction_deviation = 0.1;
           #if ENABLED(DUAL_X_CARRIAGE)
             if (extruder_duplication_enabled) {
               enable_e1();
-              g_uc_extruder_last_move[1] = BLOCK_BUFFER_SIZE * 2;
+              g_uc_extruder_last_move[1] = (BLOCK_BUFFER_SIZE) * 2;
             }
           #endif
-          g_uc_extruder_last_move[0] = BLOCK_BUFFER_SIZE * 2;
+          g_uc_extruder_last_move[0] = (BLOCK_BUFFER_SIZE) * 2;
           #if EXTRUDERS > 1
             if (g_uc_extruder_last_move[1] == 0) disable_e1();
             #if EXTRUDERS > 2
@@ -654,7 +731,7 @@ float junction_deviation = 0.1;
         #if EXTRUDERS > 1
           case 1:
             enable_e1();
-            g_uc_extruder_last_move[1] = BLOCK_BUFFER_SIZE * 2;
+            g_uc_extruder_last_move[1] = (BLOCK_BUFFER_SIZE) * 2;
             if (g_uc_extruder_last_move[0] == 0) disable_e0();
             #if EXTRUDERS > 2
               if (g_uc_extruder_last_move[2] == 0) disable_e2();
@@ -666,7 +743,7 @@ float junction_deviation = 0.1;
           #if EXTRUDERS > 2
             case 2:
               enable_e2();
-              g_uc_extruder_last_move[2] = BLOCK_BUFFER_SIZE * 2;
+              g_uc_extruder_last_move[2] = (BLOCK_BUFFER_SIZE) * 2;
               if (g_uc_extruder_last_move[0] == 0) disable_e0();
               if (g_uc_extruder_last_move[1] == 0) disable_e1();
               #if EXTRUDERS > 3
@@ -676,7 +753,7 @@ float junction_deviation = 0.1;
             #if EXTRUDERS > 3
               case 3:
                 enable_e3();
-                g_uc_extruder_last_move[3] = BLOCK_BUFFER_SIZE * 2;
+                g_uc_extruder_last_move[3] = (BLOCK_BUFFER_SIZE) * 2;
                 if (g_uc_extruder_last_move[0] == 0) disable_e0();
                 if (g_uc_extruder_last_move[1] == 0) disable_e1();
                 if (g_uc_extruder_last_move[2] == 0) disable_e2();
@@ -745,16 +822,16 @@ float junction_deviation = 0.1;
   }
   float inverse_millimeters = 1.0 / block->millimeters;  // Inverse millimeters to remove multiple divides
 
-  // Calculate speed in mm/second for each axis. No divide by zero due to previous checks.
+  // Calculate moves/second for this move. No divide by zero due to previous checks.
   float inverse_second = feed_rate * inverse_millimeters;
 
   int moves_queued = movesplanned();
 
   // Slow down when the buffer starts to empty, rather than wait at the corner for a buffer refill
   #if ENABLED(OLD_SLOWDOWN) || ENABLED(SLOWDOWN)
-    bool mq = moves_queued > 1 && moves_queued < BLOCK_BUFFER_SIZE / 2;
+    bool mq = moves_queued > 1 && moves_queued < (BLOCK_BUFFER_SIZE) / 2;
     #if ENABLED(OLD_SLOWDOWN)
-      if (mq) feed_rate *= 2.0 * moves_queued / BLOCK_BUFFER_SIZE;
+      if (mq) feed_rate *= 2.0 * moves_queued / (BLOCK_BUFFER_SIZE);
     #endif
     #if ENABLED(SLOWDOWN)
       //  segment time im micro seconds
@@ -774,27 +851,35 @@ float junction_deviation = 0.1;
   block->nominal_speed = block->millimeters * inverse_second; // (mm/sec) Always > 0
   block->nominal_rate = ceil(block->step_event_count * inverse_second); // (step/sec) Always > 0
 
-  #if ENABLED(FILAMENT_SENSOR)
+  #if ENABLED(FILAMENT_WIDTH_SENSOR)
+    static float filwidth_e_count = 0, filwidth_delay_dist = 0;
+
     //FMM update ring buffer used for delay with filament measurements
+    if (extruder == FILAMENT_SENSOR_EXTRUDER_NUM && filwidth_delay_index2 >= 0) {  //only for extruder with filament sensor and if ring buffer is initialized
 
-    if (extruder == FILAMENT_SENSOR_EXTRUDER_NUM && delay_index2 > -1) {  //only for extruder with filament sensor and if ring buffer is initialized
+      const int MMD_CM = MAX_MEASUREMENT_DELAY + 1, MMD_MM = MMD_CM * 10;
 
-      const int MMD = MAX_MEASUREMENT_DELAY + 1, MMD10 = MMD * 10;
+      // increment counters with next move in e axis
+      filwidth_e_count += delta_mm[E_AXIS];
+      filwidth_delay_dist += delta_mm[E_AXIS];
 
-      delay_dist += delta_mm[E_AXIS];  // increment counter with next move in e axis
-      while (delay_dist >= MMD10) delay_dist -= MMD10; // loop around the buffer
-      while (delay_dist < 0) delay_dist += MMD10;
+      // Only get new measurements on forward E movement
+      if (filwidth_e_count > 0.0001) {
 
-      delay_index1 = delay_dist / 10.0;  // calculate index
-      delay_index1 = constrain(delay_index1, 0, MAX_MEASUREMENT_DELAY); // (already constrained above)
+        // Loop the delay distance counter (modulus by the mm length)
+        while (filwidth_delay_dist >= MMD_MM) filwidth_delay_dist -= MMD_MM;
 
-      if (delay_index1 != delay_index2) { // moved index
-        meas_sample = widthFil_to_size_ratio() - 100;  // Subtract 100 to reduce magnitude - to store in a signed char
-        while (delay_index1 != delay_index2) {
-          // Increment and loop around buffer
-          if (++delay_index2 >= MMD) delay_index2 -= MMD;
-          delay_index2 = constrain(delay_index2, 0, MAX_MEASUREMENT_DELAY);
-          measurement_delay[delay_index2] = meas_sample;
+        // Convert into an index into the measurement array
+        filwidth_delay_index1 = (int)(filwidth_delay_dist / 10.0 + 0.0001);
+
+        // If the index has changed (must have gone forward)...
+        if (filwidth_delay_index1 != filwidth_delay_index2) {
+          filwidth_e_count = 0; // Reset the E movement counter
+          int8_t meas_sample = widthFil_to_size_ratio() - 100; // Subtract 100 to reduce magnitude - to store in a signed char
+          do {
+            filwidth_delay_index2 = (filwidth_delay_index2 + 1) % MMD_CM; // The next unused slot
+            measurement_delay[filwidth_delay_index2] = meas_sample;       // Store the measurement
+          } while (filwidth_delay_index1 != filwidth_delay_index2);       // More slots to fill?
         }
       }
     }
@@ -842,7 +927,7 @@ float junction_deviation = 0.1;
          max_y_segment_time = max(ys0, max(ys1, ys2)),
          min_xy_segment_time = min(max_x_segment_time, max_y_segment_time);
     if (min_xy_segment_time < MAX_FREQ_TIME) {
-      float low_sf = speed_factor * min_xy_segment_time / MAX_FREQ_TIME;
+      float low_sf = speed_factor * min_xy_segment_time / (MAX_FREQ_TIME);
       speed_factor = min(speed_factor, low_sf);
     }
   #endif // XY_FREQUENCY_LIMIT
@@ -856,7 +941,7 @@ float junction_deviation = 0.1;
 
   // Compute and limit the acceleration rate for the trapezoid generator.
   float steps_per_mm = block->step_event_count / block->millimeters;
-  long bsx = block->steps[X_AXIS], bsy = block->steps[Y_AXIS], bsz = block->steps[Z_AXIS], bse = block->steps[E_AXIS];
+  unsigned long bsx = block->steps[X_AXIS], bsy = block->steps[Y_AXIS], bsz = block->steps[Z_AXIS], bse = block->steps[E_AXIS];
   if (bsx == 0 && bsy == 0 && bsz == 0) {
     block->acceleration_st = ceil(retract_acceleration * steps_per_mm); // convert to: acceleration steps/sec^2
   }
@@ -871,11 +956,12 @@ float junction_deviation = 0.1;
                 xsteps = axis_steps_per_sqr_second[X_AXIS],
                 ysteps = axis_steps_per_sqr_second[Y_AXIS],
                 zsteps = axis_steps_per_sqr_second[Z_AXIS],
-                esteps = axis_steps_per_sqr_second[E_AXIS];
-  if ((float)acc_st * bsx / block->step_event_count > xsteps) acc_st = xsteps;
-  if ((float)acc_st * bsy / block->step_event_count > ysteps) acc_st = ysteps;
-  if ((float)acc_st * bsz / block->step_event_count > zsteps) acc_st = zsteps;
-  if ((float)acc_st * bse / block->step_event_count > esteps) acc_st = esteps;
+                esteps = axis_steps_per_sqr_second[E_AXIS],
+                allsteps = block->step_event_count;
+  if (xsteps < (acc_st * bsx) / allsteps) acc_st = (xsteps * allsteps) / bsx;
+  if (ysteps < (acc_st * bsy) / allsteps) acc_st = (ysteps * allsteps) / bsy;
+  if (zsteps < (acc_st * bsz) / allsteps) acc_st = (zsteps * allsteps) / bsz;
+  if (esteps < (acc_st * bse) / allsteps) acc_st = (esteps * allsteps) / bse;
 
   block->acceleration_st = acc_st;
   block->acceleration = acc_st / steps_per_mm;
@@ -892,7 +978,7 @@ float junction_deviation = 0.1;
     // Compute maximum allowable entry speed at junction by centripetal acceleration approximation.
     // Let a circle be tangent to both previous and current path line segments, where the junction
     // deviation is defined as the distance from the junction to the closest edge of the circle,
-    // colinear with the circle center. The circular segment joining the two paths represents the
+    // collinear with the circle center. The circular segment joining the two paths represents the
     // path of centripetal acceleration. Solve for max velocity based on max acceleration about the
     // radius of the circle, defined indirectly by junction deviation. This may be also viewed as
     // path width or max_jerk in the previous grbl version. This approach does not actually deviate
@@ -976,11 +1062,11 @@ float junction_deviation = 0.1;
     }
     else {
       long acc_dist = estimate_acceleration_distance(0, block->nominal_rate, block->acceleration_st);
-      float advance = (STEPS_PER_CUBIC_MM_E * EXTRUDER_ADVANCE_K) * (cse * cse * EXTRUSION_AREA * EXTRUSION_AREA) * 256;
+      float advance = ((STEPS_PER_CUBIC_MM_E) * (EXTRUDER_ADVANCE_K)) * (cse * cse * (EXTRUSION_AREA) * (EXTRUSION_AREA)) * 256;
       block->advance = advance;
       block->advance_rate = acc_dist ? advance / (float)acc_dist : 0;
     }
-    /*
+    /**
       SERIAL_ECHO_START;
      SERIAL_ECHOPGM("advance :");
      SERIAL_ECHO(block->advance/256.0);
@@ -1004,6 +1090,12 @@ float junction_deviation = 0.1;
 } // plan_buffer_line()
 
 #if ENABLED(AUTO_BED_LEVELING_FEATURE) && DISABLED(DELTA)
+
+  /**
+   * Get the XYZ position of the steppers as a vector_3.
+   *
+   * On CORE machines XYZ is derived from ABC.
+   */
   vector_3 plan_get_position() {
     vector_3 position = vector_3(st_get_axis_position_mm(X_AXIS), st_get_axis_position_mm(Y_AXIS), st_get_axis_position_mm(Z_AXIS));
 
@@ -1016,8 +1108,14 @@ float junction_deviation = 0.1;
 
     return position;
   }
+
 #endif // AUTO_BED_LEVELING_FEATURE && !DELTA
 
+/**
+ * Directly set the planner XYZ position (hence the stepper positions).
+ *
+ * On CORE machines stepper ABC will be translated from the given XYZ.
+ */
 #if ENABLED(AUTO_BED_LEVELING_FEATURE) || ENABLED(MESH_BED_LEVELING)
   void plan_set_position(float x, float y, float z, const float& e)
 #else
@@ -1025,7 +1123,7 @@ float junction_deviation = 0.1;
 #endif // AUTO_BED_LEVELING_FEATURE || MESH_BED_LEVELING
   {
     #if ENABLED(MESH_BED_LEVELING)
-      if (mbl.active) z += mbl.get_z(x, y);
+      if (mbl.active) z += mbl.get_z(x - home_offset[X_AXIS], y - home_offset[Y_AXIS]);
     #elif ENABLED(AUTO_BED_LEVELING_FEATURE)
       apply_rotation_xyz(plan_bed_level_matrix, x, y, z);
     #endif

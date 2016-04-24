@@ -71,8 +71,8 @@
 //============================ Bed Leveling =================================
 //===========================================================================
 
-#ifndef DELTA_PROBABLE_RADIUS
-  #define DELTA_PROBABLE_RADIUS (DELTA_PRINTABLE_RADIUS-25)
+#ifndef DELTA_PROBEABLE_RADIUS
+  #define DELTA_PROBEABLE_RADIUS (DELTA_PRINTABLE_RADIUS-25)
 #endif
 #ifndef AUTO_BED_LEVELING_GRID_POINTS
   #define AUTO_BED_LEVELING_GRID_POINTS 7

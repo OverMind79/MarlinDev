@@ -1,4 +1,26 @@
 /**
+ * Marlin 3D Printer Firmware
+ * Copyright (C) 2016 MarlinFirmware [https://github.com/MarlinFirmware/Marlin]
+ *
+ * Based on Sprinter and grbl.
+ * Copyright (C) 2011 Camiel Gubbels / Erik van der Zalm
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ */
+
+/**
  * stepper.cpp - stepper motor driver: executes motion plans using stepper motors
  * Marlin Firmware
  *
@@ -30,6 +52,7 @@
 #include "language.h"
 #include "cardreader.h"
 #include "speed_lookuptable.h"
+
 #if HAS_DIGIPOTSS
   #include <SPI.h>
 #endif
@@ -39,6 +62,9 @@
 //===========================================================================
 block_t* current_block;  // A pointer to the block currently being traced
 
+#if ENABLED(HAS_Z_MIN_PROBE)
+  volatile bool z_probe_is_active = false;
+#endif
 
 //===========================================================================
 //============================= private variables ===========================
@@ -87,11 +113,21 @@ static volatile char endstop_hit_bits = 0; // use X_MIN, Y_MIN, Z_MIN and Z_MIN_
   bool abort_on_endstop_hit = false;
 #endif
 
-#if PIN_EXISTS(MOTOR_CURRENT_PWM_XY)
-  int motor_current_setting[3] = DEFAULT_PWM_MOTOR_CURRENT;
+#if HAS_MOTOR_CURRENT_PWM
+  #ifndef PWM_MOTOR_CURRENT
+    #define PWM_MOTOR_CURRENT DEFAULT_PWM_MOTOR_CURRENT
+  #endif
+  const int motor_current_setting[3] = PWM_MOTOR_CURRENT;
 #endif
 
 static bool check_endstops = true;
+static bool check_endstops_global =
+  #if ENABLED(ENDSTOPS_ONLY_FOR_HOMING)
+    false
+  #else
+    true
+  #endif
+;
 
 volatile long count_position[NUM_AXIS] = { 0 }; // Positions of stepper motors, in step units
 volatile signed char count_direction[NUM_AXIS] = { 1 };
@@ -245,33 +281,48 @@ volatile signed char count_direction[NUM_AXIS] = { 1 };
 #define ENABLE_STEPPER_DRIVER_INTERRUPT()  SBI(TIMSK1, OCIE1A)
 #define DISABLE_STEPPER_DRIVER_INTERRUPT() CBI(TIMSK1, OCIE1A)
 
-void endstops_hit_on_purpose() {
-  endstop_hit_bits = 0;
-}
+void enable_endstops(bool check) { check_endstops = check; }
+
+void enable_endstops_globally(bool check) { check_endstops_global = check_endstops = check; }
+
+void endstops_not_homing() { check_endstops = check_endstops_global; }
+
+void endstops_hit_on_purpose() { endstop_hit_bits = 0; }
 
 void checkHitEndstops() {
   if (endstop_hit_bits) {
+    #if ENABLED(ULTRA_LCD)
+      char chrX = ' ', chrY = ' ', chrZ = ' ', chrP = ' ';
+      #define _SET_STOP_CHAR(A,C) (chr## A = C)
+    #else
+      #define _SET_STOP_CHAR(A,C) ;
+    #endif
+
+    #define _ENDSTOP_HIT_ECHO(A,C) do{ \
+      SERIAL_ECHOPAIR(" " STRINGIFY(A) ":", endstops_trigsteps[A ##_AXIS] / axis_steps_per_unit[A ##_AXIS]); \
+      _SET_STOP_CHAR(A,C); }while(0)
+
+    #define _ENDSTOP_HIT_TEST(A,C) \
+      if (TEST(endstop_hit_bits, A ##_MIN) || TEST(endstop_hit_bits, A ##_MAX)) \
+        _ENDSTOP_HIT_ECHO(A,C)
+
     SERIAL_ECHO_START;
     SERIAL_ECHOPGM(MSG_ENDSTOPS_HIT);
-    if (TEST(endstop_hit_bits, X_MIN)) {
-      SERIAL_ECHOPAIR(" X:", (float)endstops_trigsteps[X_AXIS] / axis_steps_per_unit[X_AXIS]);
-      LCD_MESSAGEPGM(MSG_ENDSTOPS_HIT "X");
-    }
-    if (TEST(endstop_hit_bits, Y_MIN)) {
-      SERIAL_ECHOPAIR(" Y:", (float)endstops_trigsteps[Y_AXIS] / axis_steps_per_unit[Y_AXIS]);
-      LCD_MESSAGEPGM(MSG_ENDSTOPS_HIT "Y");
-    }
-    if (TEST(endstop_hit_bits, Z_MIN)) {
-      SERIAL_ECHOPAIR(" Z:", (float)endstops_trigsteps[Z_AXIS] / axis_steps_per_unit[Z_AXIS]);
-      LCD_MESSAGEPGM(MSG_ENDSTOPS_HIT "Z");
-    }
+    _ENDSTOP_HIT_TEST(X, 'X');
+    _ENDSTOP_HIT_TEST(Y, 'Y');
+    _ENDSTOP_HIT_TEST(Z, 'Z');
+
     #if ENABLED(Z_MIN_PROBE_ENDSTOP)
-      if (TEST(endstop_hit_bits, Z_MIN_PROBE)) {
-        SERIAL_ECHOPAIR(" Z_MIN_PROBE:", (float)endstops_trigsteps[Z_AXIS] / axis_steps_per_unit[Z_AXIS]);
-        LCD_MESSAGEPGM(MSG_ENDSTOPS_HIT "ZP");
-      }
+      #define P_AXIS Z_AXIS
+      if (TEST(endstop_hit_bits, Z_MIN_PROBE)) _ENDSTOP_HIT_ECHO(P, 'P');
     #endif
     SERIAL_EOL;
+
+    #if ENABLED(ULTRA_LCD)
+      char msg[3 * strlen(MSG_LCD_ENDSTOPS) + 8 + 1]; // Room for a UTF 8 string
+      sprintf_P(msg, PSTR(MSG_LCD_ENDSTOPS " %c %c %c %c"), chrX, chrY, chrZ, chrP);
+      lcd_setstatus(msg);
+    #endif
 
     endstops_hit_on_purpose();
 
@@ -285,14 +336,6 @@ void checkHitEndstops() {
     #endif
   }
 }
-
-#if ENABLED(COREXY)
-  #define CORE_AXIS_2 B_AXIS
-#elif ENABLED(COREXZ)
-  #define CORE_AXIS_2 C_AXIS
-#endif
-
-void enable_endstops(bool check) { check_endstops = check; }
 
 // Check endstops - Called from ISR!
 inline void update_endstops() {
@@ -428,17 +471,18 @@ inline void update_endstops() {
             }
           #else // !Z_DUAL_ENDSTOPS
 
-            UPDATE_ENDSTOP(Z, MIN);
-
+            #if ENABLED(Z_MIN_PROBE_USES_Z_MIN_ENDSTOP_PIN) && ENABLED(HAS_Z_MIN_PROBE)
+              if (z_probe_is_active) UPDATE_ENDSTOP(Z, MIN);
+            #else
+              UPDATE_ENDSTOP(Z, MIN);
+            #endif
           #endif // !Z_DUAL_ENDSTOPS
-        #endif // Z_MIN_PIN
+        #endif
 
-        #if ENABLED(Z_MIN_PROBE_ENDSTOP)
-          UPDATE_ENDSTOP(Z, MIN_PROBE);
-
-          if (TEST_ENDSTOP(Z_MIN_PROBE)) {
-            endstops_trigsteps[Z_AXIS] = count_position[Z_AXIS];
-            SBI(endstop_hit_bits, Z_MIN_PROBE);
+        #if ENABLED(Z_MIN_PROBE_ENDSTOP) && DISABLED(Z_MIN_PROBE_USES_Z_MIN_ENDSTOP_PIN) && ENABLED(HAS_Z_MIN_PROBE)
+          if (z_probe_is_active) {
+            UPDATE_ENDSTOP(Z, MIN_PROBE);
+            if (TEST_ENDSTOP(Z_MIN_PROBE)) SBI(endstop_hit_bits, Z_MIN_PROBE);
           }
         #endif
       }
@@ -614,7 +658,7 @@ ISR(TIMER1_COMPA_vect) {
     current_block = NULL;
     plan_discard_current_block();
     #ifdef SD_FINISHED_RELEASECOMMAND
-      if ((cleaning_buffer_counter == 1) && (SD_FINISHED_STEPPERRELEASE)) enqueuecommands_P(PSTR(SD_FINISHED_RELEASECOMMAND));
+      if ((cleaning_buffer_counter == 1) && (SD_FINISHED_STEPPERRELEASE)) enqueue_and_echo_commands_P(PSTR(SD_FINISHED_RELEASECOMMAND));
     #endif
     cleaning_buffer_counter--;
     OCR1A = 200;
@@ -652,7 +696,11 @@ ISR(TIMER1_COMPA_vect) {
   if (current_block != NULL) {
 
     // Update endstops state, if enabled
-    if (check_endstops) update_endstops();
+    #if ENABLED(HAS_Z_MIN_PROBE)
+      if (check_endstops || z_probe_is_active) update_endstops();
+    #else
+      if (check_endstops) update_endstops();
+    #endif
 
     // Take multiple steps per interrupt (For high speed moves)
     for (int8_t i = 0; i < step_loops; i++) {
@@ -1047,11 +1095,36 @@ void st_init() {
  */
 void st_synchronize() { while (blocks_queued()) idle(); }
 
+/**
+ * Set the stepper positions directly in steps
+ *
+ * The input is based on the typical per-axis XYZ steps.
+ * For CORE machines XYZ needs to be translated to ABC.
+ *
+ * This allows st_get_axis_position_mm to correctly
+ * derive the current XYZ position later on.
+ */
 void st_set_position(const long& x, const long& y, const long& z, const long& e) {
   CRITICAL_SECTION_START;
-  count_position[X_AXIS] = x;
-  count_position[Y_AXIS] = y;
-  count_position[Z_AXIS] = z;
+
+  #if ENABLED(COREXY)
+    // corexy positioning
+    // these equations follow the form of the dA and dB equations on http://www.corexy.com/theory.html
+    count_position[A_AXIS] = x + y;
+    count_position[B_AXIS] = x - y;
+    count_position[Z_AXIS] = z;
+  #elif ENABLED(COREXZ)
+    // corexz planning
+    count_position[A_AXIS] = x + z;
+    count_position[Y_AXIS] = y;
+    count_position[C_AXIS] = x - z;
+  #else
+    // default non-h-bot planning
+    count_position[X_AXIS] = x;
+    count_position[Y_AXIS] = y;
+    count_position[Z_AXIS] = z;
+  #endif
+
   count_position[E_AXIS] = e;
   CRITICAL_SECTION_END;
 }
@@ -1062,15 +1135,22 @@ void st_set_e_position(const long& e) {
   CRITICAL_SECTION_END;
 }
 
-long st_get_position(uint8_t axis) {
+/**
+ * Get a stepper's position in steps.
+ */
+long st_get_position(AxisEnum axis) {
   CRITICAL_SECTION_START;
   long count_pos = count_position[axis];
   CRITICAL_SECTION_END;
   return count_pos;
 }
 
+/**
+ * Get an axis position according to stepper position(s)
+ * For CORE machines apply translation from ABC to XYZ.
+ */
 float st_get_axis_position_mm(AxisEnum axis) {
-  float axis_pos;
+  float axis_steps;
   #if ENABLED(COREXY) | ENABLED(COREXZ)
     if (axis == X_AXIS || axis == CORE_AXIS_2) {
       CRITICAL_SECTION_START;
@@ -1079,14 +1159,14 @@ float st_get_axis_position_mm(AxisEnum axis) {
       CRITICAL_SECTION_END;
       // ((a1+a2)+(a1-a2))/2 -> (a1+a2+a1-a2)/2 -> (a1+a1)/2 -> a1
       // ((a1+a2)-(a1-a2))/2 -> (a1+a2-a1+a2)/2 -> (a2+a2)/2 -> a2
-      axis_pos = (pos1 + ((axis == X_AXIS) ? pos2 : -pos2)) / 2.0f;
+      axis_steps = (pos1 + ((axis == X_AXIS) ? pos2 : -pos2)) / 2.0f;
     }
     else
-      axis_pos = st_get_position(axis);
+      axis_steps = st_get_position(axis);
   #else
-    axis_pos = st_get_position(axis);
+    axis_steps = st_get_position(axis);
   #endif
-  return axis_pos / axis_steps_per_unit[axis];
+  return axis_steps / axis_steps_per_unit[axis];
 }
 
 void finishAndDisableSteppers() {
@@ -1176,19 +1256,18 @@ void quickStop() {
 
 #endif //BABYSTEPPING
 
-// From Arduino DigitalPotControl example
-void digitalPotWrite(int address, int value) {
-  #if HAS_DIGIPOTSS
+#if HAS_DIGIPOTSS
+
+  // From Arduino DigitalPotControl example
+  void digitalPotWrite(int address, int value) {
     digitalWrite(DIGIPOTSS_PIN, LOW); // take the SS pin low to select the chip
     SPI.transfer(address); //  send in the address and value via SPI:
     SPI.transfer(value);
     digitalWrite(DIGIPOTSS_PIN, HIGH); // take the SS pin high to de-select the chip:
     //delay(10);
-  #else
-    UNUSED(address);
-    UNUSED(value);
-  #endif
-}
+  }
+
+#endif //HAS_DIGIPOTSS
 
 // Initialize Digipot Motor Current
 void digipot_init() {
@@ -1202,13 +1281,19 @@ void digipot_init() {
       digipot_current(i, digipot_motor_current[i]);
     }
   #endif
-  #ifdef MOTOR_CURRENT_PWM_XY_PIN
-    pinMode(MOTOR_CURRENT_PWM_XY_PIN, OUTPUT);
-    pinMode(MOTOR_CURRENT_PWM_Z_PIN, OUTPUT);
-    pinMode(MOTOR_CURRENT_PWM_E_PIN, OUTPUT);
-    digipot_current(0, motor_current_setting[0]);
-    digipot_current(1, motor_current_setting[1]);
-    digipot_current(2, motor_current_setting[2]);
+  #if HAS_MOTOR_CURRENT_PWM
+    #if PIN_EXISTS(MOTOR_CURRENT_PWM_XY)
+      pinMode(MOTOR_CURRENT_PWM_XY_PIN, OUTPUT);
+      digipot_current(0, motor_current_setting[0]);
+    #endif
+    #if PIN_EXISTS(MOTOR_CURRENT_PWM_Z)
+      pinMode(MOTOR_CURRENT_PWM_Z_PIN, OUTPUT);
+      digipot_current(1, motor_current_setting[1]);
+    #endif
+    #if PIN_EXISTS(MOTOR_CURRENT_PWM_E)
+      pinMode(MOTOR_CURRENT_PWM_E_PIN, OUTPUT);
+      digipot_current(2, motor_current_setting[2]);
+    #endif
     //Set timer5 to 31khz so the PWM of the motor power is as constant as possible. (removes a buzzing noise)
     TCCR5B = (TCCR5B & ~(_BV(CS50) | _BV(CS51) | _BV(CS52))) | _BV(CS50);
   #endif
@@ -1218,16 +1303,23 @@ void digipot_current(uint8_t driver, int current) {
   #if HAS_DIGIPOTSS
     const uint8_t digipot_ch[] = DIGIPOT_CHANNELS;
     digitalPotWrite(digipot_ch[driver], current);
-  #elif defined(MOTOR_CURRENT_PWM_XY_PIN)
+  #elif HAS_MOTOR_CURRENT_PWM
+    #define _WRITE_CURRENT_PWM(P) analogWrite(P, 255L * current / (MOTOR_CURRENT_PWM_RANGE))
     switch (driver) {
-      case 0: analogWrite(MOTOR_CURRENT_PWM_XY_PIN, 255L * current / MOTOR_CURRENT_PWM_RANGE); break;
-      case 1: analogWrite(MOTOR_CURRENT_PWM_Z_PIN, 255L * current / MOTOR_CURRENT_PWM_RANGE); break;
-      case 2: analogWrite(MOTOR_CURRENT_PWM_E_PIN, 255L * current / MOTOR_CURRENT_PWM_RANGE); break;
+      #if PIN_EXISTS(MOTOR_CURRENT_PWM_XY)
+        case 0: _WRITE_CURRENT_PWM(MOTOR_CURRENT_PWM_XY_PIN); break;
+      #endif
+      #if PIN_EXISTS(MOTOR_CURRENT_PWM_Z)
+        case 1: _WRITE_CURRENT_PWM(MOTOR_CURRENT_PWM_Z_PIN); break;
+      #endif
+      #if PIN_EXISTS(MOTOR_CURRENT_PWM_E)
+        case 2: _WRITE_CURRENT_PWM(MOTOR_CURRENT_PWM_E_PIN); break;
+      #endif
     }
   #else
     UNUSED(driver);
     UNUSED(current);
-#endif
+  #endif
 }
 
 void microstep_init() {
