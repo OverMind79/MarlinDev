@@ -9,11 +9,11 @@
       "maintainer": "Richard Wackerbarth",
       "platforms": [
         {
-          "version": "0.0.2",
+          "version": "0.0.3",
           "url": "https://github.com/MarlinFirmware/MarlinDev/archive/MarlinPlatform-1.6.7-b.zip",
           "archiveFileName": "MarlinPlatform-1.6.7-b.zip",
-          "size": "1836466",
-          "checksum": "SHA-256:ea9333a67a8b6475f7168ca14895cf9b8bf0caef73fd739d4bff6c3da3401c0a",
+          "size": "1836723",
+          "checksum": "SHA-256:69c412b25fc91727876cafe7056746f092bb4312070935bdebab2e64c2b0411a",
           "name": "Marlin_for_IDE_1.6.7",
           "architecture": "avr",
           "boards": [
