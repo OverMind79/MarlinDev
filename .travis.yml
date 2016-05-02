@@ -1,0 +1,6 @@
+# blacklist
+branches:
+  except:
+    - platform
+    - IDE-*
+    - MarlinPlatform-*
