@@ -1,3 +1,3 @@
-# This repository is no longer functional
+# This is a place Bobc can do his 32-Bit-RcBugFix work with full Administrator Priviledge
 
-All development effort over Marlin 3D printer firmware is now concentrated on our [main repository](https://github.com/MarlinFirmware/Marlin).
+
