@@ -1,3 +1,1 @@
-# This is a place Bobc can do his 32-Bit-RcBugFix work with full Administrator Priviledge
-
-
+### This repo is currently in use by @bobc for development of Marlin's 32-Bit support.
